@@ -1,0 +1,47 @@
+This PowerShell automation script provides a fully interactive and subscription-wide management tool for restarting Kubernetes deployments hosted on Azure Kubernetes Service (AKS). It is designed for large, multi-subscription Azure environments where deployments must be located, verified, and restarted in a controlled and auditable way.
+
+The script automatically discovers AKS clusters across all Azure subscriptions and allows intelligent filtering using one or multiple tags (with OR-based matching). It then inspects each eligible cluster to identify whether it contains one or more specific deployment names provided by the user. Only clusters containing those deployments are shown for selection.
+
+Once deployments are identified, users can choose to:
+
+Restart deployments across all matching clusters
+
+Restart deployments in specific clusters only
+
+Perform a Dry Run, where no changes are made and the script only simulates the steps
+
+The restart process uses kubectl rollout restart with admin credentials (avoiding kubelogin or AAD prompts). Each deployment restart is monitored live for up to 10 minutes, showing real-time pod rollout status. The script measures and logs:
+
+Per-deployment start time
+
+Per-deployment end time
+
+Downtime duration (in seconds)
+
+Overall script start time
+
+Overall script end time
+
+Total script duration
+
+At the end of execution, all results are exported automatically into a CSV file, creating an auditable record of actions performed, including:
+
+Subscription
+
+Cluster name
+
+Resource group
+
+Deployment name
+
+Namespace
+
+Tags used for cluster selection
+
+Operator identity (RequestedBy)
+
+Restart status (Completed, Timeout, DryRun)
+
+Downtime and timestamps
+
+This makes the tool ideal for production operations, support teams, SRE workflows, or large distributed AKS landscapes where deployment restarts must be performed safely, consistently, and with full auditability.
