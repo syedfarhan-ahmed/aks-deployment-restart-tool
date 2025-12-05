@@ -9,15 +9,19 @@ The script is fully interactive and designed for Cloud, DevOps, and SRE teams wh
 ## Features
 
 - Scans **all Azure subscriptions** visible to the logged-in user
-- Optional **tag-based cluster filtering**  
+- Optional **tag-based cluster filtering**
   - Supports **multiple tags**
   - Uses **OR logic** → a cluster is included if it matches *any* of the tags
   - Can also run **without tags** (all AKS clusters)
 - Supports **multiple deployment names** (comma-separated)
-- Discovers only clusters that actually contain the given deployments
+- Automatically discovers only clusters that actually contain the given deployments
 - Lets you:
-  - Restart on **all matching clusters**, or  
-  - Restart on **selected clusters only**
+  - Process **all matching clusters**, or  
+  - **Select specific clusters** by index
+- Shows **current status for all selected deployments in all selected clusters** *before* any restart:
+  - Deployment replica summary (desired, updated, ready, available)
+  - Pod-level status table per deployment (color-coded by phase)
+- Single **global confirmation** to restart **all** shown deployments
 - **Dry Run mode** (no changes made, simulates everything)
 - Uses `az aks get-credentials --admin` (no `kubelogin` / AAD prompt)
 - Live rollout monitoring for each deployment (up to 10 minutes)
@@ -30,18 +34,20 @@ The script is fully interactive and designed for Cloud, DevOps, and SRE teams wh
 
 ## Prerequisites
 
-- **PowerShell** (5.1+ or PowerShell 7 recommended)
-- **Azure CLI** (`az`) installed and logged in
-- **kubectl** installed and accessible in `PATH`
+- **PowerShell**
+  - Windows PowerShell 5.1+ or PowerShell 7+
+- **Azure CLI** (`az`) installed and in `PATH`
+- **kubectl** installed and in `PATH`
 - Permissions:
-  - Read AKS clusters and get credentials
-  - Permission to restart deployments in the target namespaces
+  - Read access to AKS clusters and ability to run `az aks get-credentials --admin`
+  - Permissions to restart deployments in the relevant namespaces
 
 ---
 
 ## Script Location
 
-By default, the main script is:
+By convention, the script lives at:
 
 ```text
-scripts/aks-restart.ps1
+.\aks-restart.ps1
+
