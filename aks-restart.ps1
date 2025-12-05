@@ -1,16 +1,14 @@
 # =========================
 # AKS Deployment Restart Script
-# - Optionally filters AKS clusters across ALL subscriptions by multiple tags
-# - Tag filter uses OR logic: cluster matches if it has ANY of the provided tags
-# - If tags are not used, all AKS clusters in all subscriptions are considered
-# - Filters further by presence of multiple specific deployment names
-# - Lets user restart those deployments on all or selected clusters
-# - Uses --admin credentials (no kubelogin prompt)
-# - Shows live restart status with 10-minute timeout
-# - Logs downtime and status to CSV (no external modules)
-# - Supports DRY RUN mode (no actual restarts)
-# - Tags, when used, are collected one-by-one (NAME + VALUE per tag)
-# - Records overall script StartTime, EndTime, Duration
+# - Optional tag filter (OR logic across multiple tags)
+# - Multi-deployment support
+# - Cross-subscription AKS discovery
+# - Dry Run mode
+# - Live rollout monitoring (10 min)
+# - Per-deployment downtime tracking
+# - Overall script start/end/duration
+# - Shows status for ALL selected clusters/deployments once,
+#   then single global restart confirmation
 # =========================
 
 function Login-ToAzure {
@@ -58,7 +56,7 @@ function Get-AksClustersByTags {
 
                         $tagProp = $tags.PSObject.Properties | Where-Object { $_.Name -eq $key }
                         if ($tagProp -and $tagProp.Value -eq $value) {
-                            # OR logic: match if ANY tag matches
+                            # OR logic: cluster is included if ANY tag matches
                             $includeCluster = $true
                             break
                         }
@@ -97,6 +95,95 @@ function Get-DeploymentsInCluster {
     return $deployments
 }
 
+function Show-DeploymentStatusTable {
+    param (
+        [object]$deploymentObject,
+        [string]$clusterName
+    )
+
+    $depName   = $deploymentObject.metadata.name
+    $namespace = $deploymentObject.metadata.namespace
+
+    Write-Host ""
+    Write-Host "===== CURRENT STATUS: Cluster '$clusterName' | Namespace '$namespace' | Deployment '$depName' ====="
+
+    # Deployment-level info (we already have object, but get JSON again for status fields)
+    $depJson = kubectl get deployment $depName -n $namespace -o json 2>$null | ConvertFrom-Json
+    if ($depJson) {
+        $desired    = $depJson.spec.replicas
+        if (-not $desired -or $desired -lt 1) { $desired = 1 }
+        $available  = $depJson.status.availableReplicas
+        $ready      = $depJson.status.readyReplicas
+        $updated    = $depJson.status.updatedReplicas
+
+        Write-Host ("Replicas -> Desired: {0}, Updated: {1}, Ready: {2}, Available: {3}" -f `
+            $desired, `
+            ($updated   -as [string]), `
+            ($ready     -as [string]), `
+            ($available -as [string]))
+    } else {
+        Write-Host "Unable to fetch deployment JSON details."
+    }
+
+    # Pod status table
+    $pods = kubectl get pods -n $namespace --selector=app=$depName -o json 2>$null | ConvertFrom-Json
+    if ($pods -and $pods.items -and $pods.items.Count -gt 0) {
+        $header = "{0,-50} {1,-12} {2,-10} {3,-20}" -f "POD", "PHASE", "READY", "DETAIL"
+        $line   = "-" * ($header.Length)
+        Write-Host ""
+        Write-Host $header
+        Write-Host $line
+
+        foreach ($p in $pods.items) {
+            $podName = $p.metadata.name
+            $phase   = $p.status.phase
+
+            $cs = $p.status.containerStatuses
+            if ($cs) {
+                $readyCount = ($cs | Where-Object { $_.ready }).Count
+                $totalCount = $cs.Count
+                $readyText  = "$readyCount/$totalCount"
+                $detail     = $null
+
+                $waiting = $cs | Where-Object { $_.state.waiting } | Select-Object -First 1
+                if ($waiting) {
+                    $detail = $waiting.state.waiting.reason
+                } elseif ($cs[0].state.terminated) {
+                    $detail = $cs[0].state.terminated.reason
+                } else {
+                    $detail = ""
+                }
+            } else {
+                $readyText = "0/0"
+                $detail    = ""
+            }
+
+            # Color logic
+            $color = "White"
+            if ($phase -eq "Running") {
+                $color = "Green"
+            } elseif ($phase -eq "Pending") {
+                $color = "Yellow"
+            } else {
+                $color = "Red"
+            }
+
+            if ($detail -eq "CrashLoopBackOff") {
+                $color = "Red"
+            }
+
+            $row = "{0,-50} {1,-12} {2,-10} {3,-20}" -f $podName, $phase, $readyText, $detail
+            Write-Host $row -ForegroundColor $color
+        }
+    } else {
+        Write-Host ""
+        Write-Host "No pods found for selector app=$depName"
+    }
+
+    Write-Host "====================================================================="
+    Write-Host ""
+}
+
 function Restart-DeploymentsInCluster {
     param (
         [string]  $clusterName,
@@ -128,11 +215,7 @@ function Restart-DeploymentsInCluster {
         $namespace = $deployment.metadata.namespace
 
         Write-Host ""
-        if ($DryRun) {
-            Write-Host "DRY RUN: would restart deployment '$depName' in namespace '$namespace' on cluster '$clusterName'..."
-        } else {
-            Write-Host "Restarting deployment '$depName' in namespace '$namespace' on cluster '$clusterName'..."
-        }
+        Write-Host "Restarting deployment '$depName' in namespace '$namespace' on cluster '$clusterName'..."
 
         $startTime = Get-Date
 
@@ -154,15 +237,17 @@ function Restart-DeploymentsInCluster {
         $restartStatus += $status
 
         if ($DryRun) {
-            $endTime = $startTime
-            $status.EndTime = $endTime
-            $status.DowntimeSeconds = 0
+            Write-Host "DRY RUN: Skipping actual restart for '$depName'."
             $status.Status = 'DryRun'
+            $status.EndTime = $startTime
+            $status.DowntimeSeconds = 0
             continue
         }
 
+        # Do the restart
         kubectl rollout restart deployment $depName --namespace $namespace | Out-Null
-        
+
+        # Live monitoring
         $maxWaitSeconds      = 600
         $pollIntervalSeconds = 5
         $elapsedSeconds      = 0
@@ -175,7 +260,7 @@ function Restart-DeploymentsInCluster {
             Start-Sleep -Seconds $pollIntervalSeconds
             $elapsedSeconds += $pollIntervalSeconds
 
-            $podsJson = kubectl get pods --namespace $namespace --selector=app=$depName -o json | ConvertFrom-Json
+            $podsJson = kubectl get pods --namespace $namespace --selector=app=$depName -o json 2>$null | ConvertFrom-Json
 
             $runningCount = 0
             if ($podsJson -and $podsJson.items) {
@@ -366,7 +451,7 @@ function Main {
 
     Write-Host ""
     Write-Host "Cluster selection options:"
-    Write-Host " - Type 'all' to restart in ALL listed clusters"
+    Write-Host " - Type 'all' to process ALL listed clusters"
     Write-Host " - Or specify indices (e.g. 0 or 0,2,3)"
     $choice = Read-Host "Enter choice"
 
@@ -378,7 +463,6 @@ function Main {
     else {
         $indices = $choice -split ',' |
             ForEach-Object { $_.Trim() } |
-            Where-Object { $_ -match '^[Yy]?$' -eq $false } |
             Where-Object { $_ -match '^\d+$' } |
             ForEach-Object { [int]$_ }
 
@@ -396,21 +480,49 @@ function Main {
         return
     }
 
-    # 6) Final confirmation
+    # 6) SHOW STATUS FOR ALL SELECTED CLUSTERS + DEPLOYMENTS
     Write-Host ""
-    Write-Host "You are about to process deployments in the following clusters:"
-    foreach ($c in $selectedClusters) {
-        $deps = $c.matchingDeployments -join ', '
-        Write-Host " - $($c.name) | RG: $($c.resourceGroup) | Sub: $($c.subscriptionName) | Deployments: $deps"
+    Write-Host "================ CURRENT STATUS FOR SELECTED CLUSTERS / DEPLOYMENTS ================"
+
+    foreach ($cluster in $selectedClusters) {
+        $clusterName      = $cluster.name
+        $resourceGroup    = $cluster.resourceGroup
+        $subscriptionId   = $cluster.subscriptionId
+        $subscriptionName = $cluster.subscriptionName
+
+        Write-Host ""
+        Write-Host "---- Cluster: $clusterName | RG: $resourceGroup | Sub: $subscriptionName ----"
+
+        # Get deployments again for this cluster to show full status, limited to matchingDeployments
+        $deploymentsJson = Get-DeploymentsInCluster -clusterName $clusterName -resourceGroup $resourceGroup -subscriptionId $subscriptionId
+        if (-not $deploymentsJson -or -not $deploymentsJson.items) {
+            Write-Host "No deployments found in this cluster."
+            continue
+        }
+
+        $matching = $deploymentsJson.items | Where-Object { $cluster.matchingDeployments -contains $_.metadata.name }
+        if (-not $matching -or $matching.Count -eq 0) {
+            Write-Host "No matching deployments found in this cluster (unexpected)."
+            continue
+        }
+
+        foreach ($dep in $matching) {
+            Show-DeploymentStatusTable -deploymentObject $dep -clusterName $clusterName
+        }
     }
 
-    $confirm = Read-Host "Proceed in the selected clusters? (y/n)"
+    Write-Host "============================================================================"
+    Write-Host ""
+
+    # 7) Global confirmation
+    Write-Host "You are about to restart ALL of the deployments shown above in ALL selected clusters."
+    $confirm = Read-Host "Proceed with restart for ALL? (y/n)"
     if (-not ($confirm -match '^[Yy]$')) {
-        Write-Host "Operation cancelled. No deployments processed."
+        Write-Host "Operation cancelled. No deployments restarted."
         return
     }
 
-    # 7) Restart / Dry-run
+    # 8) Restart / Dry-run
     $allRestartStatus = @()
 
     foreach ($cluster in $selectedClusters) {
@@ -435,7 +547,7 @@ function Main {
         if ($result) { $allRestartStatus += $result }
     }
 
-    # 8) Script end timing + enrich results + CSV log
+    # 9) Script end timing + enrich results + CSV log
     $scriptEnd = Get-Date
     $scriptDurationSeconds = [int]($scriptEnd - $scriptStart).TotalSeconds
 
@@ -460,7 +572,7 @@ function Main {
         Write-Host "No deployments were processed. CSV file not created."
     }
 
-    # 9) Print script timing summary
+    # 10) Print script timing summary
     Write-Host ""
     Write-Host "Script started at : $scriptStart"
     Write-Host "Script ended at   : $scriptEnd"
